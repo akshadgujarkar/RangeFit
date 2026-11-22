@@ -50,6 +50,50 @@ interface IRangeFit {
     /// @param minRequired Minimum required deposit value.
     error InitialDepositTooSmall(uint256 value, uint256 minRequired);
 
+    /// @notice Thrown when a proposed tick is not an integer multiple of the pool's tick spacing.
+    /// @param tick The invalid tick.
+    /// @param tickSpacing Required spacing between ticks.
+    error TicksNotAligned(int24 tick, int24 tickSpacing);
+
+    /// @notice Thrown when lower tick is greater than or equal to upper tick.
+    /// @param lower Proposed lower tick.
+    /// @param upper Proposed upper tick.
+    error InvalidTickRange(int24 lower, int24 upper);
+
+    /// @notice Thrown when current pool spot price is outside the proposed range bounds.
+    /// @param spotPriceX96 Current spot price in Q96.
+    /// @param sqrtLowerX96 Lower tick price in Q96.
+    /// @param sqrtUpperX96 Upper tick price in Q96.
+    error PriceOutOfRange(uint160 spotPriceX96, uint160 sqrtLowerX96, uint160 sqrtUpperX96);
+
+    /// @notice Thrown when inventory cannot form an active concentrated liquidity range at the current price.
+    error InfeasibleInventory();
+
+    /// @notice Thrown when computed liquidity does not meet keeper's minLiquidity slippage limit.
+    /// @param actual Actual liquidity computed.
+    /// @param minRequired Minimum required liquidity.
+    error InsufficientLiquidityMinted(uint128 actual, uint128 minRequired);
+
+    /// @notice Thrown when rebalance dust exceeds maximum allowed basis points.
+    /// @param actualBps Actual dust in basis points.
+    /// @param maxBps Maximum permitted dust basis points.
+    error DustToleranceExceeded(uint256 actualBps, uint256 maxBps);
+
+    /// @notice Thrown when computed liquidity is zero.
+    error ZeroLiquidity();
+
+    // -------------------------------------------------------------------------
+    // Structs
+    // -------------------------------------------------------------------------
+
+    /// @notice Parameters supplied to trigger a swapless rebalance.
+    struct RebalanceParams {
+        int24 newTickLower;
+        int24 newTickUpper;
+        uint128 minLiquidity;
+        uint256 maxDustBps;
+    }
+
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
@@ -76,4 +120,62 @@ interface IRangeFit {
     /// @param amount0 Amount of token0 returned to the user.
     /// @param amount1 Amount of token1 returned to the user.
     event Withdraw(address indexed user, uint256 shares, uint256 amount0, uint256 amount1);
+
+    /// @notice Emitted when a swapless rebalance is executed.
+    /// @param oldTickLower Previous lower tick bound.
+    /// @param oldTickUpper Previous upper tick bound.
+    /// @param oldLiquidity Previous active liquidity.
+    /// @param newTickLower New lower tick bound.
+    /// @param newTickUpper New upper tick bound.
+    /// @param newLiquidity New active liquidity deployed.
+    /// @param idle0 Leftover unallocated token0 held as idle dust.
+    /// @param idle1 Leftover unallocated token1 held as idle dust.
+    /// @param dustBps Dust value in basis points relative to total portfolio value.
+    event Rebalanced(
+        int24 oldTickLower,
+        int24 oldTickUpper,
+        uint128 oldLiquidity,
+        int24 newTickLower,
+        int24 newTickUpper,
+        uint128 newLiquidity,
+        uint256 idle0,
+        uint256 idle1,
+        uint256 dustBps
+    );
+
+    // -------------------------------------------------------------------------
+    // External View & State Functions
+    // -------------------------------------------------------------------------
+
+    /// @notice Rebalances vault inventory into a newly solved range without swapping.
+    /// @param params Parameters specifying target ticks, minLiquidity, and maxDustBps.
+    /// @return newLiquidity Total active liquidity established in the new range.
+    function rebalance(RebalanceParams calldata params) external returns (uint128 newLiquidity);
+
+    /// @notice Previews the outcome of rebalancing into a proposed tick range.
+    /// @param newTickLower Proposed lower tick.
+    /// @param newTickUpper Proposed upper tick.
+    /// @return newLiquidity Potential liquidity to be minted.
+    /// @return used0 Token0 amount absorbed into the position.
+    /// @return used1 Token1 amount absorbed into the position.
+    /// @return dust0 Unused token0 remaining as idle dust.
+    /// @return dust1 Unused token1 remaining as idle dust.
+    /// @return dustBps Dust in basis points.
+    function previewRebalance(
+        int24 newTickLower,
+        int24 newTickUpper
+    ) external view returns (
+        uint128 newLiquidity,
+        uint256 used0,
+        uint256 used1,
+        uint256 dust0,
+        uint256 dust1,
+        uint256 dustBps
+    );
+
+    /// @notice Returns current active position bounds and liquidity.
+    /// @return currentTickLower Active lower tick.
+    /// @return currentTickUpper Active upper tick.
+    /// @return currentLiquidity Active liquidity in pool.
+    function position() external view returns (int24 currentTickLower, int24 currentTickUpper, uint128 currentLiquidity);
 }

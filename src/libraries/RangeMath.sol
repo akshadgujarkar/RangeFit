@@ -391,6 +391,32 @@ library RangeMath {
         dustBps = FullMath.mulDiv(totalDustValue, 10_000, totalValue);
     }
 
+    /// @notice Computes amounts of token0 and token1 held by a given liquidity amount at current spot price.
+    /// @param sqrtPriceX96 Current pool spot price in Q96.
+    /// @param sqrtLowerX96 Lower tick price in Q96.
+    /// @param sqrtUpperX96 Upper tick price in Q96.
+    /// @param liquidity Amount of active liquidity.
+    /// @return amount0 Token0 held by liquidity.
+    /// @return amount1 Token1 held by liquidity.
+    function getAmountsForLiquidity(
+        uint160 sqrtPriceX96,
+        uint160 sqrtLowerX96,
+        uint160 sqrtUpperX96,
+        uint128 liquidity
+    ) internal pure returns (uint256 amount0, uint256 amount1) {
+        if (liquidity == 0) return (0, 0);
+        if (sqrtPriceX96 <= sqrtLowerX96) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtLowerX96, sqrtUpperX96, liquidity, false);
+            amount1 = 0;
+        } else if (sqrtPriceX96 < sqrtUpperX96) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtPriceX96, sqrtUpperX96, liquidity, false);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLowerX96, sqrtPriceX96, liquidity, false);
+        } else {
+            amount0 = 0;
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtLowerX96, sqrtUpperX96, liquidity, false);
+        }
+    }
+
     /// @notice Helper to value an amount of token0 in terms of token1 using spot sqrtPriceX96.
     /// @dev amount0 * (sqrtPriceX96 / Q96)^2
     /// @param amount0 Amount of token0
