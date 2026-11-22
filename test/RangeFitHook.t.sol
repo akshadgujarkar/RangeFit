@@ -95,6 +95,9 @@ contract RangeFitHookTest is BaseTest {
         poolId = poolKey.toId();
         poolManager.initialize(poolKey, Constants.SQRT_PRICE_1_1);
 
+        // Configure managed pool key
+        hook.setPoolKey(poolKey);
+
         // Deploy external actor helper
         externalAdder = new ExternalLiquidityAdder(poolManager);
     }
@@ -162,7 +165,6 @@ contract RangeFitHookTest is BaseTest {
 
         // When external contract attempts modifyLiquidity on the pool,
         // RangeFitHook._beforeAddLiquidity reverts with UnauthorizedAddLiquidity(sender).
-        // CustomRevert bubble-up wraps the error when called through PoolManager.
         vm.expectRevert();
         externalAdder.addLiquidity(poolKey, tickLower, tickUpper, 10e18);
     }
