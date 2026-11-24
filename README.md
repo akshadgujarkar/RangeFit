@@ -61,69 +61,101 @@ When feasible, this analytical solution uniquely determines the upper price boun
 RangeFit implements the Uniswap v4 **Hook-as-LP** architecture, unifying the vault and hook into a single smart contract.
 
 ```
-+--------------------------------------------------------------------------------+
-|                                  RangeFitHook                                  |
-|                                                                                |
-|  [User Deposits & Withdrawals]                                                 |
-|    - Any-ratio deposits into idle reserves (single-sided or mixed)             |
-|    - ERC-4626 style fair valuation share minting                               |
-|    - Anti-inflation dead shares defense                                        |
-|    - Pro-rata in-range withdrawals (active position + idle reserves)           |
-|                                                                                |
-|  [Analytical Range Solver (RangeMath)]                                         |
-|    - Exact Q96 fixed-point solver                                              |
-|    - Spacing tick alignment & minimal-dust candidate search                    |
-|    - 1-wei rounding overdraw safety clamp                                      |
-|                                                                                |
-|  [Uniswap v4 Flash Accounting Integration]                                     |
-|    - Liquidity gating: beforeAddLiquidity (only hook can LP)                   |
-|    - Atomic unlockCallback: Remove Old -> Verify -> Add New -> Settle Net      |
-+--------------------------------------------------------------------------------+
-                                       |
-                   unlockCallback      |      modifyLiquidity / take / settle
-                                       v
-+--------------------------------------------------------------------------------+
-|                           Uniswap v4 PoolManager                               |
-|  - Flash accounting transient delta settlement                                 |
-|  - Dynamic fee pool support                                                    |
-+--------------------------------------------------------------------------------+
++-----------------------------------------------------------------------------------------+
+|                                      RangeFitHook                                       |
+|                                                                                         |
+|  [User Deposits & Withdrawals]                                                          |
+|    - Any-ratio deposits into idle reserves (single-sided or mixed)                      |
+|    - ERC-4626 style fair valuation share minting at smoothed EMA price                  |
+|    - Anti-inflation dead shares defense (1,000 dead shares to address(0))               |
+|    - Pro-rata in-range withdrawals (active position + idle reserves)                    |
+|    - Graceful degradation: withdrawals always work even when inventory is infeasible   |
+|                                                                                         |
+|  [Analytical Range Solver (RangeMath)]                                                  |
+|    - Exact Q96 fixed-point closed-form solver                                           |
+|    - Discrete tick spacing alignment & minimal-dust candidate search                    |
+|    - 1-wei rounding overdraw safety clamp                                               |
+|                                                                                         |
+|  [Guards & Threat Protection (Guards)]                                                  |
+|    - Continuous EMA price tracking in afterSwap                                         |
+|    - Max price deviation guard (maxDeviationBps) against flash loans                   |
+|    - Rebalance cooldown timing (cooldown)                                               |
+|    - Gated keeper-only access control (keeperOnly, isKeeper)                            |
+|    - Range width bounds validation (minWidthTicks, maxWidthTicks)                       |
+|    - Boundary proximity detection (rebalanceDue flag)                                   |
+|                                                                                         |
+|  [Dynamic Directional Fee Skew (FeeSkew)]                                               |
+|    - beforeSwap dynamic fee override using Uniswap v4 DYNAMIC_FEE_FLAG                 |
+|    - Real-time inventory skew: skew = (value0 / totalValue) - targetRatio               |
+|    - Direction mapping: swaps worsening skew pay higher fees; balance-restoring cheaper  |
+|    - Safe override bit enforcement: protects against the Uniswap v4 "override with 0"   |
+|                                                                                         |
+|  [Uniswap v4 Flash Accounting Integration]                                              |
+|    - Liquidity gating: beforeAddLiquidity (only hook can LP)                            |
+|    - Atomic unlockCallback: Remove Old -> Verify -> Add New -> Settle Net               |
++-----------------------------------------------------------------------------------------+
+                                           |
+                       unlockCallback      |      modifyLiquidity / take / settle / swap
+                                           v
++-----------------------------------------------------------------------------------------+
+|                               Uniswap v4 PoolManager                                    |
+|  - Flash accounting transient delta settlement                                          |
+|  - Dynamic fee pool support (LPFeeLibrary.DYNAMIC_FEE_FLAG)                             |
++-----------------------------------------------------------------------------------------+
 ```
 
 ---
 
 ## Key Features & Functionality
 
-### 1. Any-Ratio Vault Deposits
-- Users can deposit tokens in **any proportion**—including single-sided token0, single-sided token1, or asymmetric ratios.
-- Incoming tokens are placed in idle reserves without undergoing immediate swaps.
-- Shares are minted based on the real-time valuation of the vault's total assets (active position + idle reserves) denominated in token1 terms.
-- **Dead Shares Defense:** $1,000$ dead shares are permanently minted to `address(0)` on the first deposit, neutralizing ERC-4626 first-depositor inflation attacks.
+### 1. Any-Ratio Vault Deposits & Fair Share Accounting
+- Users can deposit tokens in **any proportion**—single-sided token0, single-sided token1, or arbitrary mixtures.
+- Incoming tokens enter idle reserves without incurring immediate swaps or slippage.
+- Shares are minted based on total vault valuation evaluated at the smoothed Exponential Moving Average (EMA) price, preventing flash-loan share manipulation.
+- **Dead Shares Defense:** 1,000 dead shares are permanently burned to `address(0)` on the first deposit, neutralizing ERC-4626 first-depositor inflation attacks.
 
 ### 2. Swapless Rebalance Lifecycle (`unlockCallback`)
 Rebalancing is executed atomically in a single Uniswap v4 unlock callback:
 1. **Remove Existing Liquidity:** Calls `modifyLiquidity(-L)` on the old range. The returned delta credits principal and all accrued LP fees.
 2. **Compute Total Inventory:** Combines idle reserves with returned principal and fees:
    $$\text{inv}_0 = \text{idle}_0 + \Delta_0, \quad \text{inv}_1 = \text{idle}_1 + \Delta_1$$
-3. **Verify Proposed Range:** Checks tick spacing alignment, range ordering, spot price containment, and solver feasibility.
-4. **1-Wei Round-Up Safety Clamp:** Clamps liquidity so that token requirements rounded up by the pool never exceed available inventory.
-5. **Deploy Asymmetric Liquidity:** Calls `modifyLiquidity(+L')` on the new range to establish the swapless position.
-6. **Settle Net Deltas:**
+3. **Verify Proposed Range:** Checks tick spacing alignment, range ordering, spot price containment, range width bounds, and solver feasibility.
+4. **Deviation Guard:** Confirms that the current pool spot price has not deviated beyond `maxDeviationBps` from the smoothed EMA price.
+5. **1-Wei Round-Up Safety Clamp:** Clamps liquidity so that token requirements rounded up by the pool never exceed available inventory.
+6. **Deploy Asymmetric Liquidity:** Calls `modifyLiquidity(+L')` on the new range to establish the swapless position.
+7. **Settle Net Deltas:**
    - Positive net credits are withdrawn to the vault via `poolManager.take()`.
    - Negative net debts are paid from idle reserves via `poolManager.sync()`, token transfer, and `poolManager.settle()`.
-   - Net transient deltas in the `PoolManager` resolve to zero.
+   - All transient deltas in the `PoolManager` resolve to exact zero.
 
-### 3. Dust Retention & Fee Compounding
-- Any fractional token amounts left over due to tick spacing discrete steps remain in the vault as `idle0` and `idle1`.
-- When the next rebalance occurs, all previously retained dust plus accrued trading fees are automatically incorporated into the total inventory and redeployed into liquidity.
+### 3. Continuous EMA Price Tracking & Flash-Loan Defense
+- The hook tracks an Exponential Moving Average (EMA) square-root price in `_afterSwap` across all swaps:
+  $$\text{EMA}_{\text{new}} = \frac{(10000 - \alpha) \cdot \text{EMA}_{\text{old}} + \alpha \cdot \text{Spot}}{10000}$$
+- **Deviation Guard:** If an attacker attempts to manipulate the spot price with a large flash loan before calling `rebalance()`, the transaction reverts with `PriceDeviationTooHigh`.
+- Rebalances are permitted only when the spot price is verified against the smoothed moving average.
 
-### 4. Fair Pro-Rata Withdrawals (Zero Cross-User Leakage)
-- When a user burns vault shares while liquidity is deployed, the vault calculates their proportional claim on both idle reserves and the active pool position:
-  $$\Delta L = \frac{L \times \text{shares}}{\text{totalShares}}$$
-- The hook removes $\Delta L$ from the pool, receives the underlying tokens, and transfers both the pool tokens and pro-rata idle tokens directly to the user.
-- Remaining depositors' share valuations and active pool concentrations are completely unaffected.
+### 4. Dynamic Directional Fee Skew
+When the vault inventory becomes skewed (e.g. 70% token0 and 30% token1), normal swapless rebalancing produces an asymmetric range. To gently nudge inventory back toward balance, RangeFit applies a **directional fee skew** in `_beforeSwap`:
+- **Swaps that worsen imbalance** (e.g. paying in token0 when the vault is already overweight token0) pay a **higher fee** (`baseFee + adjustment`).
+- **Swaps that restore balance** (e.g. removing token0 from the pool when the vault is overweight token0) pay a **discounted fee** (`baseFee - adjustment`).
+- Fees are strictly bounded within `[minFee, maxFee]`.
+- Protected against the Uniswap v4 "override with 0" pitfall by explicitly managing `LPFeeLibrary.OVERRIDE_FEE_FLAG`.
 
-### 5. Hook-as-LP Access Gating
-- `beforeAddLiquidity` hook callback enforces `sender == address(this)`. External liquidity providers cannot inject liquidity directly into the pool, preserving pool inventory ratios and protecting vault management from outside manipulation.
+### 5. Rebalance Cooldown & Keeper Allowlist Gating
+- **Cooldown:** Enforces a minimum time interval between consecutive rebalances (`lastRebalance + cooldown`), preventing rapid position churn and gas depletion during volatile spikes.
+- **Keeper Allowlist:** An optional `keeperOnly` mode restricts rebalance authorization to designated keeper bots and the vault owner, while allowing permissionless execution when disabled.
+- **Boundary Proximity Alert:** Flags `rebalanceDue = true` in `_afterSwap` whenever the spot price approaches within 20% of the active range boundaries.
+
+### 6. Dust Retention & Automatic Fee Compounding
+- Fractional token amounts left over due to discrete tick spacing remain in the vault as `idle0` and `idle1`.
+- When the next rebalance occurs, all previously retained dust plus accrued trading fees are automatically incorporated into the total inventory and redeployed into active liquidity.
+
+### 7. Graceful Fallback & Fair Pro-Rata Withdrawals
+- **No-Valid-Range Fallback:** If inventory becomes heavily one-sided (e.g. 100% token0 at 1:1 spot price) such that an active range containing the spot price cannot be formed without swapping, `rebalance()` reverts safely with `InfeasibleInventory()`.
+- **Guaranteed Withdrawals:** User withdrawals never lock up. Users can burn their shares and withdraw their exact pro-rata assets from idle reserves and active liquidity at any time, with zero cross-user leakage.
+
+### 8. Hook-as-LP Access Gating
+- `beforeAddLiquidity` callback strictly restricts pool liquidity additions to `sender == address(this)`. External liquidity providers cannot inject liquidity directly into the pool, preserving pool inventory ratios and protecting vault management from outside manipulation.
 
 ---
 
@@ -131,11 +163,13 @@ Rebalancing is executed atomically in a single Uniswap v4 unlock callback:
 
 ```
 src/
-├── RangeFitHook.sol          # Unified Uniswap v4 hook, vault accounting, and unlock callback
+├── RangeFitHook.sol          # Unified Uniswap v4 hook, vault accounting, fee skew, and unlock callback
 ├── interfaces/
 │   └── IRangeFit.sol         # Core vault errors, events, structs, and public interfaces
 └── libraries/
-    └── RangeMath.sol         # Fixed-point Q96 analytical solver, tick alignment, and dust math
+    ├── RangeMath.sol         # Fixed-point Q96 analytical solver, tick alignment, and dust math
+    ├── Guards.sol            # EMA price smoothing, deviation guards, and width validation
+    └── FeeSkew.sol           # Inventory skew calculation and dynamic directional fee adjustment
 ```
 
 ### `RangeFitHook.sol`
@@ -143,16 +177,28 @@ The primary entry point implementing `BaseHook`, `IRangeFit`, `IUnlockCallback`,
 - `deposit(uint256 amount0, uint256 amount1, uint256 minShares)`: Accepts any token ratio and mints proportional shares.
 - `withdraw(uint256 shares, uint256 min0, uint256 min1)`: Burns shares and returns pro-rata idle and position tokens.
 - `rebalance(RebalanceParams calldata params)`: Triggers swapless re-ranging through `poolManager.unlock()`.
-- `previewDeposit`, `previewWithdraw`, `previewRebalance`: View functions providing exact simulations down to the wei.
+- `previewDeposit`, `previewWithdraw`, `previewRebalance`: View functions providing simulations down to the wei.
 - `inventory()` & `totalVaultValue()`: Real-time accounting across idle reserves and concentrated liquidity.
+- `setFeeSkewEnabled`, `setFeeParams`, `setKeeper`, `setKeeperOnly`, `setCooldown`, `setMaxDeviationBps`, `setWidthBounds`: Governance controls.
 
 ### `RangeMath.sol`
 Pure mathematical library operating entirely in Q96 fixed-point and integer arithmetic (`FullMath`):
-- `solveRange`: Analytical solver deriving upper price $v$ from lower price $u$, spot price $s$, and amounts $(X, Y)$.
+- `solveRange`: Analytical solver deriving upper price $v$ from lower price $u$, spot price $s$, and inventory amounts $(X, Y)$.
 - `isFeasible`: Determines if inventory can form an active in-range position at the given price.
 - `alignTicksToSpacing`: Rounds continuous solver prices to valid Uniswap v4 tick spacing multiples.
 - `computeRangeUsageAndDust`: Calculates token consumption, residual dust, and dust basis points.
 - `getAmountsForLiquidity`: Computes exact $(X, Y)$ tokens held by a given liquidity amount at current spot price.
+
+### `Guards.sol`
+Security and manipulation defense library:
+- `updateEMA`: Exponential Moving Average square-root price smoothing.
+- `computeDeviationBps` & `checkDeviation`: Relative price deviation checking against flash loans.
+- `checkWidth`: Validates that position widths satisfy minimum and maximum tick bounds.
+
+### `FeeSkew.sol`
+Directional fee adjustment library:
+- `computeSkewBps`: Evaluates inventory imbalance relative to a target ratio.
+- `computeDirectionalFee`: Adjusts swap fee based on swap direction and inventory skew, clamped between min and max bounds.
 
 ---
 
@@ -160,11 +206,13 @@ Pure mathematical library operating entirely in Q96 fixed-point and integer arit
 
 RangeFit is validated by comprehensive Foundry test suites enforcing the following mathematical and economic invariants:
 
-1. **Shares Conservation:** $\sum \text{shares}[u] + \text{DEAD\_SHARES} = \text{totalShares}$.
+1. **Shares Conservation:** $\sum_u \text{shares}[u] + \text{DeadShares} = \text{TotalShares}$ (all user shares plus permanently burned `DEAD_SHARES` strictly equal `totalShares`).
 2. **Zero Swap in Rebalancing:** During `rebalance()`, the pool swap counter and spot price remain strictly unchanged. The vault never trades against the pool.
 3. **Value Preservation:** Total vault valuation after rebalance satisfies $\text{Value}_{\text{after}} \ge \text{Value}_{\text{before}} \times (1 - \epsilon)$, where $\epsilon$ covers discrete tick rounding dust only.
 4. **Transient Delta Settlement:** Every currency delta in `PoolManager` settles to exact zero; rebalances never revert with `CurrencyNotSettled`.
 5. **No Cross-User Leakage:** Withdrawals receive exact pro-rata claims; burning shares never reduces the per-share value of remaining holders.
+6. **Price Manipulation Resilience:** Price deviations beyond `maxDeviationBps` from the smoothed EMA revert, preventing flash-loan exploits.
+7. **Directional Fee Invariant:** When overweight token0, swaps that add token0 pay strictly higher fees than swaps that remove token0.
 
 ---
 
@@ -191,14 +239,16 @@ forge build
 ### Running Tests
 
 ```bash
-# Run all test suites
+# Run all test suites across the project (68 tests)
 forge test
 
 # Run with verbose traces
 forge test -vvv
 
-# Run specific rebalance integration tests
+# Run specific test suites
 forge test --match-contract RangeFitRebalanceTest -vv
+forge test --match-contract RangeFitGuardsTest -vv
+forge test --match-contract RangeFitFeeSkewTest -vv
 ```
 
 ---
