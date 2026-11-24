@@ -82,6 +82,41 @@ interface IRangeFit {
     /// @notice Thrown when computed liquidity is zero.
     error ZeroLiquidity();
 
+    /// @notice Thrown when an unauthorized caller attempts to rebalance when keeperOnly is enabled.
+    /// @param caller The unauthorized caller address.
+    error UnauthorizedKeeper(address caller);
+
+    /// @notice Thrown when a non-owner calls an owner-restricted admin function.
+    /// @param caller The unauthorized caller address.
+    error OnlyOwner(address caller);
+
+    /// @notice Thrown when a rebalance is attempted before the cooldown period has elapsed.
+    /// @param availableAt The timestamp when the next rebalance is permitted.
+    /// @param currentTimestamp The current block timestamp.
+    error CooldownActive(uint32 availableAt, uint32 currentTimestamp);
+
+    /// @notice Thrown when the current spot price deviates excessively from the smoothed EMA price.
+    /// @param spotPriceX96 The current pool spot price.
+    /// @param emaSqrtPriceX96 The current smoothed EMA price.
+    /// @param actualBps The actual deviation in basis points.
+    /// @param maxBps The maximum allowed deviation in basis points.
+    error PriceDeviationTooHigh(
+        uint160 spotPriceX96,
+        uint160 emaSqrtPriceX96,
+        uint256 actualBps,
+        uint256 maxBps
+    );
+
+    /// @notice Thrown when a proposed range width is narrower than minWidthTicks.
+    /// @param width The proposed width in ticks.
+    /// @param minWidth The minimum allowable width.
+    error RangeTooNarrow(int24 width, int24 minWidth);
+
+    /// @notice Thrown when a proposed range width is wider than maxWidthTicks.
+    /// @param width The proposed width in ticks.
+    /// @param maxWidth The maximum allowable width.
+    error RangeTooWide(int24 width, int24 maxWidth);
+
     // -------------------------------------------------------------------------
     // Structs
     // -------------------------------------------------------------------------
@@ -142,6 +177,45 @@ interface IRangeFit {
         uint256 idle1,
         uint256 dustBps
     );
+
+    /// @notice Emitted when a keeper address's authorization status is updated.
+    /// @param keeper The keeper address.
+    /// @param allowed True if granted rebalance authorization, false if revoked.
+    event KeeperUpdated(address indexed keeper, bool allowed);
+
+    /// @notice Emitted when keeper-only enforcement is toggled.
+    /// @param enabled True if only allowlisted keepers can rebalance, false if permissionless.
+    event KeeperOnlyToggled(bool enabled);
+
+    /// @notice Emitted when the rebalance cooldown is updated.
+    /// @param oldCooldown Previous cooldown period in seconds.
+    /// @param newCooldown New cooldown period in seconds.
+    event CooldownUpdated(uint32 oldCooldown, uint32 newCooldown);
+
+    /// @notice Emitted when the maximum price deviation tolerance is updated.
+    /// @param oldDeviationBps Previous deviation tolerance in basis points.
+    /// @param newDeviationBps New deviation tolerance in basis points.
+    event MaxDeviationUpdated(uint256 oldDeviationBps, uint256 newDeviationBps);
+
+    /// @notice Emitted when range width boundaries are updated.
+    /// @param minWidth New minimum width in ticks.
+    /// @param maxWidth New maximum width in ticks.
+    event WidthBoundsUpdated(int24 minWidth, int24 maxWidth);
+
+    /// @notice Emitted when the EMA smoothing factor is updated.
+    /// @param oldAlphaBps Previous alpha factor in basis points.
+    /// @param newAlphaBps New alpha factor in basis points.
+    event EmaAlphaUpdated(uint16 oldAlphaBps, uint16 newAlphaBps);
+
+    /// @notice Emitted when contract ownership is transferred.
+    /// @param oldOwner Previous vault administrator address.
+    /// @param newOwner New vault administrator address.
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+
+    /// @notice Emitted when the Exponential Moving Average price updates.
+    /// @param oldEma Previous EMA price in Q96.
+    /// @param newEma Updated EMA price in Q96.
+    event EmaUpdated(uint160 oldEma, uint160 newEma);
 
     // -------------------------------------------------------------------------
     // External View & State Functions

@@ -22,6 +22,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {IRangeFit} from "./interfaces/IRangeFit.sol";
 import {RangeMath} from "./libraries/RangeMath.sol";
+import {Guards} from "./libraries/Guards.sol";
 
 /// @title RangeFitHook
 /// @notice Uniswap v4 Hook and Vault managing swapless concentrated liquidity re-ranging.
@@ -80,6 +81,42 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     /// @notice Exponential moving average square-root price in Q96 for manipulation-resistant valuation.
     uint160 public emaSqrtPriceX96;
 
+    /// @notice Vault administrator address.
+    address public owner;
+
+    /// @notice Mapping of authorized keeper addresses.
+    mapping(address => bool) public isKeeper;
+
+    /// @notice When true, only allowlisted keepers and owner can trigger rebalances.
+    bool public keeperOnly;
+
+    /// @notice Minimum required cooldown in seconds between consecutive rebalances.
+    uint32 public cooldown;
+
+    /// @notice Timestamp of the most recent rebalance.
+    uint32 public lastRebalance;
+
+    /// @notice Maximum allowed spot price deviation from EMA in basis points.
+    uint256 public maxDeviationBps;
+
+    /// @notice Minimum allowable width in ticks for a proposed range (0 to disable).
+    int24 public minWidthTicks;
+
+    /// @notice Maximum allowable width in ticks for a proposed range (0 to disable).
+    int24 public maxWidthTicks;
+
+    /// @notice Exponential moving average smoothing factor in basis points (default 1000 = 10%).
+    uint16 public emaAlphaBps;
+
+    /// @notice Flag indicating that current price is near or beyond active range boundaries.
+    bool public rebalanceDue;
+
+    /// @notice Enforces caller is the contract administrator.
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert OnlyOwner(msg.sender);
+        _;
+    }
+
     // -------------------------------------------------------------------------
     // Constructor & Permissions
     // -------------------------------------------------------------------------
@@ -87,7 +124,13 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     /// @notice Deploy RangeFitHook bound to the singleton PoolManager.
     /// @param _poolManager The Uniswap v4 PoolManager contract.
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
+        owner = msg.sender;
+        emaAlphaBps = 1000;
+        maxDeviationBps = 1000;
+        minWidthTicks = 60;
+        maxWidthTicks = 887220;
         emit HookInitialized(address(_poolManager), uint160(address(this)) & Hooks.ALL_HOOK_MASK);
+        emit OwnershipTransferred(address(0), msg.sender);
     }
 
     /// @notice Specifies the hook permissions required by RangeFit.
@@ -126,6 +169,11 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
         poolKey = _poolKey;
         poolId = _poolKey.toId();
         poolConfigured = true;
+
+        (uint160 spot, , , ) = poolManager.getSlot0(poolId);
+        if (spot != 0 && emaSqrtPriceX96 == 0) {
+            emaSqrtPriceX96 = spot;
+        }
 
         emit PoolConfigured(poolId);
     }
@@ -359,8 +407,20 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     /// @inheritdoc IRangeFit
     function rebalance(RebalanceParams calldata params) external nonReentrant returns (uint128 newLiquidity) {
         if (!poolConfigured) revert PoolNotConfigured();
+        if (keeperOnly && !isKeeper[msg.sender] && msg.sender != owner) {
+            revert UnauthorizedKeeper(msg.sender);
+        }
+        if (cooldown > 0 && block.timestamp < uint256(lastRebalance) + uint256(cooldown)) {
+            revert CooldownActive(lastRebalance + cooldown, uint32(block.timestamp));
+        }
+
+        Guards.checkWidth(params.newTickLower, params.newTickUpper, minWidthTicks, maxWidthTicks);
+
         bytes memory result = poolManager.unlock(abi.encode(CallbackAction.REBALANCE, params));
         newLiquidity = abi.decode(result, (uint128));
+
+        lastRebalance = uint32(block.timestamp);
+        rebalanceDue = false;
     }
 
     /// @inheritdoc IRangeFit
@@ -487,6 +547,11 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
 
         if (spotPriceX96 <= sqrtLowerX96 || spotPriceX96 >= sqrtUpperX96) {
             revert PriceOutOfRange(spotPriceX96, sqrtLowerX96, sqrtUpperX96);
+        }
+
+        // Deviation guard against smoothed EMA
+        if (maxDeviationBps > 0 && emaSqrtPriceX96 > 0) {
+            Guards.checkDeviation(spotPriceX96, emaSqrtPriceX96, maxDeviationBps);
         }
 
         if (!RangeMath.isFeasible(spotPriceX96, sqrtLowerX96, inv0, inv1)) {
@@ -640,7 +705,7 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Callback executed after each swap.
-    /// @dev Stub for Milestone 2; Milestone 5 introduces EMA spot price observation tracking.
+    /// @dev Tracks smoothed EMA price and updates rebalanceDue flag.
     /// @return selector Function selector acknowledging successful callback.
     /// @return hookDelta Secondary delta returned by hook (0).
     function _afterSwap(
@@ -650,7 +715,93 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
         BalanceDelta /* delta */,
         bytes calldata /* hookData */
     ) internal virtual override returns (bytes4 selector, int128 hookDelta) {
+        if (poolConfigured) {
+            (uint160 spotPriceX96, int24 currentTick, , ) = poolManager.getSlot0(poolId);
+            uint160 oldEma = emaSqrtPriceX96;
+            if (oldEma == 0) {
+                emaSqrtPriceX96 = spotPriceX96;
+            } else {
+                emaSqrtPriceX96 = Guards.updateEMA(oldEma, spotPriceX96, emaAlphaBps);
+            }
+            emit EmaUpdated(oldEma, emaSqrtPriceX96);
+
+            if (liquidity > 0) {
+                int24 edge = poolKey.tickSpacing;
+                if (currentTick <= tickLower + edge || currentTick >= tickUpper - edge) {
+                    rebalanceDue = true;
+                }
+            }
+        }
         return (BaseHook.afterSwap.selector, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Governance & Administration
+    // -------------------------------------------------------------------------
+
+    /// @notice Authorizes or deauthorizes a keeper address.
+    /// @param keeper Address of keeper.
+    /// @param allowed True to grant authorization, false to revoke.
+    function setKeeper(address keeper, bool allowed) external onlyOwner {
+        isKeeper[keeper] = allowed;
+        emit KeeperUpdated(keeper, allowed);
+    }
+
+    /// @notice Toggles strict keeper-only restriction for rebalancing.
+    /// @param enabled True to restrict rebalancing to allowlisted keepers and owner.
+    function setKeeperOnly(bool enabled) external onlyOwner {
+        keeperOnly = enabled;
+        emit KeeperOnlyToggled(enabled);
+    }
+
+    /// @notice Updates the rebalance cooldown in seconds.
+    /// @param newCooldown New cooldown in seconds.
+    function setCooldown(uint32 newCooldown) external onlyOwner {
+        emit CooldownUpdated(cooldown, newCooldown);
+        cooldown = newCooldown;
+    }
+
+    /// @notice Updates the maximum allowed price deviation from EMA in basis points.
+    /// @param newMaxDeviationBps New deviation tolerance in basis points.
+    function setMaxDeviationBps(uint256 newMaxDeviationBps) external onlyOwner {
+        emit MaxDeviationUpdated(maxDeviationBps, newMaxDeviationBps);
+        maxDeviationBps = newMaxDeviationBps;
+    }
+
+    /// @notice Updates the allowable range width bounds.
+    /// @param newMinWidth Minimum allowable width in ticks.
+    /// @param newMaxWidth Maximum allowable width in ticks.
+    function setWidthBounds(int24 newMinWidth, int24 newMaxWidth) external onlyOwner {
+        if (newMinWidth <= 0 || newMaxWidth < newMinWidth) {
+            revert InvalidTickRange(newMinWidth, newMaxWidth);
+        }
+        minWidthTicks = newMinWidth;
+        maxWidthTicks = newMaxWidth;
+        emit WidthBoundsUpdated(newMinWidth, newMaxWidth);
+    }
+
+    /// @notice Updates the EMA smoothing factor.
+    /// @param newAlphaBps Smoothing factor in basis points (1 - 10000).
+    function setEmaAlpha(uint16 newAlphaBps) external onlyOwner {
+        if (newAlphaBps == 0 || newAlphaBps > 10_000) revert ZeroAmount();
+        emit EmaAlphaUpdated(emaAlphaBps, newAlphaBps);
+        emaAlphaBps = newAlphaBps;
+    }
+
+    /// @notice Manually sets or initializes the EMA price (for setup or testing).
+    /// @param newEmaSqrtPriceX96 The square-root price in Q96.
+    function setEmaPrice(uint160 newEmaSqrtPriceX96) external onlyOwner {
+        uint160 oldEma = emaSqrtPriceX96;
+        emaSqrtPriceX96 = newEmaSqrtPriceX96;
+        emit EmaUpdated(oldEma, newEmaSqrtPriceX96);
+    }
+
+    /// @notice Transfers contract ownership to a new administrator.
+    /// @param newOwner Address of the new owner.
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAmount();
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
     }
 
     /// @notice Allows the vault to receive native ETH from PoolManager when settling native currency.
