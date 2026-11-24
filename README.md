@@ -60,72 +60,56 @@ When feasible, this analytical solution uniquely determines the upper price boun
 
 RangeFit implements the Uniswap v4 **Hook-as-LP** architecture, unifying the vault and hook into a single smart contract.
 
-```mermaid
-flowchart TD
-    subgraph Actors ["External Actors"]
-        User["Users & Liquidity Providers"]
-        Keeper["Keeper Bots / Vault Owner"]
-        Swapper["Traders & Arbitrageurs"]
-    end
+```
+========================================================================================================================
+                                               RANGEFIT SYSTEM ARCHITECTURE
+========================================================================================================================
 
-    subgraph HookCore ["RangeFit Core Vault & Hook (Hook-as-LP)"]
-        subgraph VaultModule ["1. Vault & Share Accounting"]
-            DepositWithdraw["deposit() & withdraw()"]
-            IdleReserves["Idle Reserves (idle0, idle1)"]
-            ShareModel["ERC-4626 Share Valuation at EMA Price<br/>Permanent Dead Shares in address(0)"]
-        end
-
-        subgraph SolverModule ["2. RangeMath Analytical Solver"]
-            Solver["Closed-Form Solver<br/>v = (s * X) / (X - Y / (s - u))"]
-            TickAlign["Tick Spacing Alignment & Neighbor Search"]
-            OverdrawGuard["1-Wei Round-Up Overdraw Guard"]
-        end
-
-        subgraph GuardModule ["3. Defense & Security Guards"]
-            EMA["Continuous EMA Smoothing<br/>(Tracked in afterSwap)"]
-            DevGuard["Deviation Guard (maxDeviationBps)<br/>Flash-Loan Price Manipulation Defense"]
-            CooldownGate["Cooldown Enforcement & Keeper Gating"]
-            ProximityAlert["Boundary Proximity Alert (rebalanceDue)"]
-        end
-
-        subgraph FeeModule ["4. Dynamic Directional Fee Skew"]
-            SkewCalc["Skew = (value0 / totalValue) - targetRatio"]
-            DirFee["beforeSwap Dynamic LP Fee<br/>Worsening Flow: BaseFee + Adj (Higher)<br/>Restoring Flow: BaseFee - Adj (Discounted)"]
-            FeeClamp["Clamped to [minFee, maxFee]<br/>LPFeeLibrary OVERRIDE_FEE_FLAG Safe"]
-        end
-    end
-
-    subgraph V4Protocol ["Uniswap v4 Protocol"]
-        PoolManager["Uniswap v4 PoolManager<br/>(Flash Accounting Singleton)"]
-        PoolState["Dynamic Fee Pool (DYNAMIC_FEE_FLAG)<br/>Concentrated Liquidity Positions"]
-    end
-
-    %% User Flow
-    User -->|"Deposit any ratio / Burn shares"| DepositWithdraw
-    DepositWithdraw <-->|"Mint shares / Pro-rata asset return"| ShareModel
-    DepositWithdraw -->|"Store unallocated assets"| IdleReserves
-
-    %% Keeper Flow
-    Keeper -->|"rebalance(params)"| CooldownGate
-    CooldownGate -->|"Verify spot vs smoothed EMA"| DevGuard
-    DevGuard -->|"Solve range for inventory (idle + pool)"| Solver
-    Solver -->|"Discrete tick bounds"| TickAlign
-    TickAlign --> OverdrawGuard
-
-    %% Swapper Flow
-    Swapper -->|"Execute Swap"| PoolManager
-    PoolManager -->|"beforeSwap callback"| DirFee
-    DirFee <-->|"Query portfolio balance"| SkewCalc
-    DirFee -->|"Return dynamic fee override"| PoolManager
-    PoolManager -->|"afterSwap callback"| EMA
-    EMA -->|"Price near tick boundary?"| ProximityAlert
-
-    %% Flash Accounting Rebalance
-    OverdrawGuard -->|"unlock(REBALANCE)"| PoolManager
-    PoolManager -->|"unlockCallback"| HookCore
-    HookCore -->|"modifyLiquidity(-L old)"| PoolState
-    HookCore -->|"modifyLiquidity(+L new)"| PoolState
-    HookCore -->|"sync / take / settle net deltas"| PoolManager
+  [ USERS & LPs ]                                [ KEEPERS / BOTS ]                           [ SWAPPERS / TRADERS ]
+   • Any-ratio token deposits                     • Price & tick monitoring                    • Standard v4 swap orders
+   • Fair share minting (EMA price)               • Solves lowest-dust range                   • Pays directional dynamic fee
+   • In-range pro-rata withdrawals                • Triggers rebalance()                       • Arbitrage restores balance
+          │                                              │                                              │
+          │ deposit() / withdraw()                       │ rebalance(params)                            │ swap()
+          ▼                                              ▼                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                     RANGEFIT HOOK                                                    │
+│                                           (Unified Vault + Uniswap v4 Hook)                                          │
+│                                                                                                                      │
+│  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌────────────────────┐ │
+│  │   VAULT & ACCOUNTING      │  │   RANGEMATH SOLVER        │  │   SECURITY & GUARDS       │  │ DIRECTIONAL FEE    │ │
+│  │   (Vault Reserves)        │  │   (Closed-Form Engine)    │  │   (Manipulation Defense)  │  │ (Dynamic Skew)     │ │
+│  ├───────────────────────────┤  ├───────────────────────────┤  ├───────────────────────────┤  ├────────────────────┤ │
+│  │ • Unallocated idle0/idle1 │  │ • Analytical solver:      │  │ • Continuous EMA in       │  │ • Computes skew:   │ │
+│  │ • ERC-4626 share pricing  │  │   v = s·X / (X - Y/(s-u)) │  │   _afterSwap callback     │  │   (val0/total)-50% │ │
+│  │   at smoothed EMA price   │  │ • Spacing tick alignment  │  │ • Deviation check guard   │  │ • beforeSwap fee   │ │
+│  │ • Anti-inflation 1,000    │  │ • Minimal dust search     │  │   (maxDeviationBps)       │  │   Worsen: base + k │ │
+│  │   dead shares defense     │  │ • 1-wei round-up overdraw │  │ • Rebalance cooldown      │  │   Restore: base - k│ │
+│  │ • Graceful fallback for   │  │   safety clamp loop       │  │ • Keeper-only allowlist   │  │ • Bounded in       │ │
+│  │   infeasible inventory    │  │ • Exact Q96 fixed-point   │  │ • Range width [min, max]  │  │   [minFee, maxFee] │ │
+│  │ • Zero-leakage withdrawal │  │   FullMath arithmetic     │  │ • rebalanceDue flag       │  │ • OVERRIDE_FEE_FLAG│ │
+│  └───────────────────────────┘  └───────────────────────────┘  └───────────────────────────┘  └────────────────────┘ │
+│                                                │                                                         ▲           │
+└────────────────────────────────────────────────┼─────────────────────────────────────────────────────────┼───────────┘
+                                                 │                                                         │
+                                                 │ 1. unlock(REBALANCE)                                    │ 2. beforeSwap /
+                                                 │    unlockCallback:                                      │    afterSwap
+                                                 │    - Remove Old Liquidity (-L)                          │    callbacks
+                                                 │    - Collect Principal & LP Fees                        │
+                                                 │    - Deploy New Liquidity (+L')                         │
+                                                 │    - Settle Net Deltas                                  │
+                                                 ▼                                                         │
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┴───────────┐
+│                                               UNISWAP v4 POOLMANAGER                                                 │
+│                                                                                                                      │
+│   • Flash Accounting Singleton (Transient storage EIP-1153)                                                          │
+│   • Dynamic Fee Pool (LPFeeLibrary.DYNAMIC_FEE_FLAG)                                                                 │
+│   • Hook Permissions Enforcement:                                                                                    │
+│       - beforeAddLiquidity: Restricts liquidity deployment to RangeFitHook only (Hook-as-LP)                         │
+│       - beforeSwap: Queries dynamic directional fee override                                                         │
+│       - afterSwap: Provides post-swap tick & spot price for continuous EMA tracking                                 │
+│   • Concentrated Liquidity Positions & Net Balance Delta Resolution                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
