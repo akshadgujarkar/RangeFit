@@ -23,6 +23,8 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IRangeFit} from "./interfaces/IRangeFit.sol";
 import {RangeMath} from "./libraries/RangeMath.sol";
 import {Guards} from "./libraries/Guards.sol";
+import {FeeSkew} from "./libraries/FeeSkew.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 
 /// @title RangeFitHook
 /// @notice Uniswap v4 Hook and Vault managing swapless concentrated liquidity re-ranging.
@@ -111,6 +113,24 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     /// @notice Flag indicating that current price is near or beyond active range boundaries.
     bool public rebalanceDue;
 
+    /// @notice Whether directional dynamic fee skew is active.
+    bool public feeSkewEnabled;
+
+    /// @notice Baseline pool swap fee in hundredths of a bip (default: 3000 = 0.30%).
+    uint24 public baseFee;
+
+    /// @notice Sensitivity coefficient scaling fee adjustment per basis point of skew.
+    uint24 public feeSensitivity;
+
+    /// @notice Minimum permitted swap fee in hundredths of a bip (default: 500 = 0.05%).
+    uint24 public minFee;
+
+    /// @notice Maximum permitted swap fee in hundredths of a bip (default: 10000 = 1.00%).
+    uint24 public maxFee;
+
+    /// @notice Target token0 inventory share in basis points (default: 5000 = 50%).
+    uint16 public targetRatioBps;
+
     /// @notice Enforces caller is the contract administrator.
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner(msg.sender);
@@ -129,6 +149,12 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
         maxDeviationBps = 1000;
         minWidthTicks = 60;
         maxWidthTicks = 887220;
+        feeSkewEnabled = true;
+        baseFee = 3000;
+        feeSensitivity = 3000;
+        minFee = 500;
+        maxFee = 10000;
+        targetRatioBps = 5000;
         emit HookInitialized(address(_poolManager), uint160(address(this)) & Hooks.ALL_HOOK_MASK);
         emit OwnershipTransferred(address(0), msg.sender);
     }
@@ -691,17 +717,43 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Callback executed before each swap.
-    /// @dev Stub for Milestone 2; Milestone 6 introduces dynamic directional fee skew.
+    /// @dev Computes dynamic directional fee based on vault inventory skew to nudge portfolio toward balance.
+    /// @param params Swap parameters including swap direction (zeroForOne).
     /// @return selector Function selector acknowledging successful callback.
     /// @return delta Swap delta override (ZERO_DELTA).
-    /// @return fee Dynamic LP fee override (0 for default pool fee).
+    /// @return fee Dynamic LP fee override with OVERRIDE_FEE_FLAG set.
     function _beforeSwap(
         address /* sender */,
         PoolKey calldata /* key */,
-        SwapParams calldata /* params */,
+        SwapParams calldata params,
         bytes calldata /* hookData */
     ) internal virtual override returns (bytes4 selector, BeforeSwapDelta delta, uint24 fee) {
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        if (!poolConfigured) {
+            return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        }
+
+        uint24 effectiveFee;
+        if (!feeSkewEnabled) {
+            effectiveFee = baseFee;
+        } else {
+            (uint256 inv0, uint256 inv1) = inventory();
+            uint160 valPrice = getValuationSqrtPriceX96();
+            int256 skewBps = FeeSkew.computeSkewBps(inv0, inv1, valPrice, targetRatioBps);
+            effectiveFee = FeeSkew.computeDirectionalFee(
+                skewBps,
+                params.zeroForOne,
+                baseFee,
+                feeSensitivity,
+                minFee,
+                maxFee
+            );
+        }
+
+        return (
+            BaseHook.beforeSwap.selector,
+            BeforeSwapDeltaLibrary.ZERO_DELTA,
+            effectiveFee | LPFeeLibrary.OVERRIDE_FEE_FLAG
+        );
     }
 
     /// @notice Callback executed after each swap.
@@ -794,6 +846,40 @@ contract RangeFitHook is BaseHook, IRangeFit, IUnlockCallback, ReentrancyGuard {
         uint160 oldEma = emaSqrtPriceX96;
         emaSqrtPriceX96 = newEmaSqrtPriceX96;
         emit EmaUpdated(oldEma, newEmaSqrtPriceX96);
+    }
+
+    /// @notice Enables or disables directional fee skew.
+    /// @param enabled True to enable directional fee skew, false to disable.
+    function setFeeSkewEnabled(bool enabled) external onlyOwner {
+        feeSkewEnabled = enabled;
+        emit FeeSkewToggled(enabled);
+    }
+
+    /// @notice Updates directional dynamic fee parameters.
+    /// @param newBaseFee Baseline fee in hundredths of a bip (pips).
+    /// @param newSensitivity Fee sensitivity in pips per 100% skew.
+    /// @param newMinFee Minimum allowed fee in pips.
+    /// @param newMaxFee Maximum allowed fee in pips.
+    /// @param newTargetRatioBps Target token0 ratio in basis points.
+    function setFeeParams(
+        uint24 newBaseFee,
+        uint24 newSensitivity,
+        uint24 newMinFee,
+        uint24 newMaxFee,
+        uint16 newTargetRatioBps
+    ) external onlyOwner {
+        if (newMinFee > newMaxFee || newBaseFee < newMinFee || newBaseFee > newMaxFee) {
+            revert InvalidFeeParameters(newMinFee, newMaxFee, newBaseFee);
+        }
+        if (newTargetRatioBps > 10_000) revert InvalidFeeParameters(newMinFee, newMaxFee, newBaseFee);
+
+        baseFee = newBaseFee;
+        feeSensitivity = newSensitivity;
+        minFee = newMinFee;
+        maxFee = newMaxFee;
+        targetRatioBps = newTargetRatioBps;
+
+        emit FeeParamsUpdated(newBaseFee, newSensitivity, newMinFee, newMaxFee, newTargetRatioBps);
     }
 
     /// @notice Transfers contract ownership to a new administrator.

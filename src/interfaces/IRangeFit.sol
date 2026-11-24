@@ -117,6 +117,12 @@ interface IRangeFit {
     /// @param maxWidth The maximum allowable width.
     error RangeTooWide(int24 width, int24 maxWidth);
 
+    /// @notice Thrown when dynamic fee parameters violate min/max bounds or base fee constraints.
+    /// @param minFee Configured minimum fee.
+    /// @param maxFee Configured maximum fee.
+    /// @param baseFee Configured base fee.
+    error InvalidFeeParameters(uint24 minFee, uint24 maxFee, uint24 baseFee);
+
     // -------------------------------------------------------------------------
     // Structs
     // -------------------------------------------------------------------------
@@ -216,6 +222,24 @@ interface IRangeFit {
     /// @param oldEma Previous EMA price in Q96.
     /// @param newEma Updated EMA price in Q96.
     event EmaUpdated(uint160 oldEma, uint160 newEma);
+
+    /// @notice Emitted when directional dynamic fee skew is toggled.
+    /// @param enabled True if dynamic fee skew is enabled, false if disabled.
+    event FeeSkewToggled(bool enabled);
+
+    /// @notice Emitted when directional fee parameters are updated.
+    /// @param baseFee Baseline fee in hundredths of a bip.
+    /// @param sensitivity Fee sensitivity coefficient in hundredths of a bip.
+    /// @param minFee Minimum permitted dynamic fee in hundredths of a bip.
+    /// @param maxFee Maximum permitted dynamic fee in hundredths of a bip.
+    /// @param targetRatioBps Target token0 ratio in basis points.
+    event FeeParamsUpdated(
+        uint24 baseFee,
+        uint24 sensitivity,
+        uint24 minFee,
+        uint24 maxFee,
+        uint16 targetRatioBps
+    );
 
     // -------------------------------------------------------------------------
     // External View & State Functions
