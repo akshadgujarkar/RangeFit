@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Unslop Graphite Neutral Ramp */
+    --background: 240 10% 3.9%; /* #09090b - deepest page surface */
+    --foreground: 0 0% 93%; /* #ededed - primary text */
+
+    --card: 240 5% 7.5%; /* #131416 - card surface */
+    --card-foreground: 0 0% 93%;
+
+    --popover: 240 5% 7.5%;
+    --popover-foreground: 0 0% 93%;
+
+    /* Quiet Accent: Precise Cyan / Technical White */
+    --primary: 189 94% 43%; /* #06b6d4 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 4% 12%; /* #1c1d20 - raised controls */
+    --secondary-foreground: 0 0% 93%;
+
+    --muted: 240 4% 12%;
+    --muted-foreground: 240 5% 55%; /* #71717a - meta & captions */
+
+    --accent: 240 4% 14%;
+    --accent-foreground: 0 0% 95%;
+
+    --destructive: 0 72% 51%; /* #ef4444 */
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 240 4% 14%; /* hairline 8% white equivalent */
+    --input: 240 4% 14%;
+    --ring: 189 94% 43%;
+
+    --radius: 0.625rem; /* 10px control radius, nested cards 12-14px */
+  }
+}
+
+body {
+  @apply bg-background text-foreground antialiased min-h-screen selection:bg-cyan-500/20 selection:text-cyan-300;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", Helvetica, Arial, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11", "tnum";
+}
+
+/* Hairline border utility conforming to unslop 8% neutral rule */
+.border-hairline {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.surface-raised {
+  background-color: #161719;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.surface-card {
+  background-color: #111214;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
